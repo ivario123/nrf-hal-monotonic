@@ -8,20 +8,32 @@
 use rtic_monotonic::Monotonic;
 
 use core::marker::PhantomData;
+use core::ops::{Add, Sub};
 use fugit;
 
 /// Implementors of this trait can be used as sources for the [`MonotonicTimer`].
 pub trait Mono {
     type RegPtr: Sized;
+    type Instant: Ord
+        + Copy
+        + Add<Self::Duration, Output = Self::Instant>
+        + Sub<Self::Duration, Output = Self::Instant>
+        + Sub<Self::Instant, Output = Self::Duration>;
+    type Duration;
+    /// Returns a reference to the underlying register
     unsafe fn reg<'a>() -> &'a Self::RegPtr;
+    /// Sets the clock freq
     unsafe fn init();
-    unsafe fn now(overflow: &mut u8) -> fugit::TimerInstantU32<1_000_000>;
-    unsafe fn set_compare(instant: fugit::TimerInstantU32<1_000_000>, overflow: &mut u8);
+    /// Returns the current clock count
+    unsafe fn now(overflow: &mut u8) -> Self::Instant;
+    /// Sets the comparison value
+    unsafe fn set_compare(instant: Self::Instant, overflow: &mut u8);
+    /// Clears the comparison flag
     unsafe fn clear_compare_flag();
+    /// Sets the clock to 0 and clears all pending interrupts
     unsafe fn reset();
-    unsafe fn zero() -> fugit::TimerInstantU32<1_000_000> {
-        fugit::TimerInstantU32::from_ticks(0)
-    }
+    /// Returns zero.
+    unsafe fn zero() -> Self::Instant;
 }
 
 /// Monotonic Timer
@@ -49,11 +61,12 @@ impl<T: Mono> MonotonicTimer<T> {
         }
     }
 }
-
+/// Blanket [`Monotonic`] implementation
+/// This is just a frontend, allowing the backend implementations
+/// to handle all the different register accesses needed.
 impl<T: Mono> Monotonic for MonotonicTimer<T> {
-    type Instant = fugit::TimerInstantU32<1_000_000>;
-
-    type Duration = fugit::TimerDurationU32<1_000_000>;
+    type Instant = T::Instant;
+    type Duration = T::Duration;
 
     fn now(&mut self) -> Self::Instant {
         unsafe { T::now(&mut self.overflow) }
@@ -92,38 +105,44 @@ macro_rules! timers {
         $(
             $(#[$feature_gate])?
                 impl Mono for $timer {
+                    type Instant = fugit::TimerInstantU32<1_000_000>;
+                    type Duration = fugit::TimerDurationU32<1_000_000>;
                     type RegPtr = $reg_block;
-                    
-                    #[inline(always)]   
+
+                    #[inline(always)]
                     unsafe fn reg<'a>() -> &'a Self::RegPtr {
                         &*$timer::PTR
                     }
-                
+
                     unsafe fn init() {
                         let timer = Self::reg();
                         timer.prescaler.write(|w| { w.prescaler().bits(4) }); // 1 MHz
                         timer.bitmode.write(|w| { w.bitmode()._32bit() });
                     }
-                
-                    unsafe fn now(_:&mut u8) -> fugit::TimerInstantU32<1_000_000> {
+
+                    unsafe fn now(_:&mut u8) -> Self::Instant {
                         let timer = Self::reg();
                         timer.tasks_capture[1].write(|w| w.bits(1));
                         fugit::TimerInstantU32::from_ticks(timer.cc[1].read().bits())
                     }
-                
-                    unsafe fn set_compare(instant: fugit::TimerInstantU32<1_000_000>,_:&mut u8) {
+
+                    unsafe fn set_compare(instant: Self::Instant,_:&mut u8) {
                         Self::reg().cc[0].write(|w| w.cc().bits(instant.duration_since_epoch().ticks()));
                     }
-                
+
                     unsafe fn clear_compare_flag() {
                         Self::reg().events_compare[0].write(|w| w); // Clear the value
                     }
-                
+
                     unsafe fn reset() {
                         let timer = Self::reg();
                         timer.intenset.modify(|_, w| w.compare0().set());
                         timer.tasks_clear.write(|w| w.bits(1));
                         timer.tasks_start.write(|w| w.bits(1));
+                    }
+
+                    unsafe fn zero() -> Self::Instant{
+                        fugit::TimerInstantU32::from_ticks(0)
                     }
                 }
         )+
@@ -141,19 +160,21 @@ macro_rules! rtcs {
         $(
             $( #[$feature_gate] )?
             impl Mono for $rtc {
+                type Instant = fugit::TimerInstantU32<32_768>;
+                type Duration = fugit::TimerDurationU32<32_768>;
                 type RegPtr = RtcRegisterBlock;
-                
+
                 #[inline(always)]
                 unsafe fn reg<'a>() -> &'a Self::RegPtr {
                     &*$rtc::PTR
                 }
-            
+
                 unsafe fn init() {
                     let timer = Self::reg();
                     timer.prescaler.write(|w| w.bits(0)); //32_768 hz
                 }
-            
-                unsafe fn now(overflow: &mut u8) -> fugit::TimerInstantU32<1_000_000> {
+
+                unsafe fn now(overflow: &mut u8) -> Self::Instant{
                     let timer = Self::reg();
                     let cnt = timer.counter.read().bits();
                     let ovf = (if timer.events_ovrflw.read().bits() == 1 {
@@ -161,15 +182,15 @@ macro_rules! rtcs {
                     } else {
                         *overflow
                     }) as u32;
-            
+
                     fugit::TimerInstantU32::from_ticks((ovf << 24) | cnt)
                 }
                 /// This is lifted straight from [https://gist.github.com/korken89/fe94a475726414dd1bce031c76adc3dd]
-                unsafe fn set_compare(instant: fugit::TimerInstantU32<1_000_000>, overflow: &mut u8) {
+                unsafe fn set_compare(instant:Self::Instant, overflow: &mut u8) {
                     let now = Self::now(overflow);
-            
+
                     const MIN_TICKS_FOR_COMPARE: u32 = 3;
-            
+
                     // Since the timer may or may not overflow based on the requested compare val, we check
                     // how many ticks are left.
                     //
@@ -185,14 +206,14 @@ macro_rules! rtcs {
                         } // Will not overflow
                         _ => 0, // Will overflow or in the past, set the same value as after overflow to not get extra interrupts
                     };
-            
+
                     Self::reg().cc[0].write(|w| w.bits(val))
                 }
-            
+
                 unsafe fn clear_compare_flag() {
                     Self::reg().events_compare[0].write(|w| w.bits(0)); // Clear the value
                 }
-            
+
                 unsafe fn reset() {
                     let timer = Self::reg();
                     timer.intenset.modify(|_, w| w.compare0().set());
@@ -200,16 +221,20 @@ macro_rules! rtcs {
                     timer.tasks_clear.write(|w| w.bits(1));
                     timer.tasks_start.write(|w| w.bits(1));
                 }
+
+                unsafe fn zero() -> Self::Instant{
+                    fugit::TimerInstantU32::from_ticks(0)
+                }
             }
           )+
     };
 }
 
 #[cfg(any(feature = "9160", feature = "5340-app", feature = "5340-net"))]
-use crate::pac::{ rtc0_ns::RegisterBlock as RtcRegisterBlock, RTC0_NS as RTC0, RTC1_NS as RTC1 };
+use crate::pac::{rtc0_ns::RegisterBlock as RtcRegisterBlock, RTC0_NS as RTC0, RTC1_NS as RTC1};
 
 #[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
-use crate::pac::{ rtc0::RegisterBlock as RtcRegisterBlock, RTC0, RTC1 };
+use crate::pac::{rtc0::RegisterBlock as RtcRegisterBlock, RTC0, RTC1};
 
 #[cfg(any(feature = "52832", feature = "52833", feature = "52840"))]
 use crate::pac::RTC2;
@@ -223,23 +248,21 @@ rtcs! {
 
 #[cfg(any(feature = "9160", feature = "5340-app", feature = "5340-net"))]
 use crate::pac::{
-    timer0_ns::{ RegisterBlock as RegBlock0 },
-    TIMER0_NS as TIMER0,
-    TIMER1_NS as TIMER1,
+    timer0_ns::RegisterBlock as RegBlock0, TIMER0_NS as TIMER0, TIMER1_NS as TIMER1,
     TIMER2_NS as TIMER2,
 };
 
 #[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
-use crate::pac::{ timer0::{ RegisterBlock as RegBlock0 }, TIMER0, TIMER1, TIMER2 };
+use crate::pac::{timer0::RegisterBlock as RegBlock0, TIMER0, TIMER1, TIMER2};
 
 #[cfg(any(feature = "52832", feature = "52833", feature = "52840"))]
-use crate::pac::{ TIMER3, TIMER4 };
+use crate::pac::{TIMER3, TIMER4};
 
 #[cfg(any(feature = "52832", feature = "52840"))]
-use crate::pac::timer3::{ RegisterBlock as RegBlock3 };
+use crate::pac::timer3::RegisterBlock as RegBlock3;
 
 #[cfg(feature = "52833")]
-use crate::pac::timer0::{ RegisterBlock as RegBlock3 };
+use crate::pac::timer0::RegisterBlock as RegBlock3;
 
 timers!(
     TIMER0,RegBlock0;
@@ -249,5 +272,5 @@ timers!(
     TIMER3,RegBlock3;
     #[cfg(any(feature = "52832", feature = "52833", feature = "52840"))]
     TIMER4,RegBlock3;
-    
+
 );
