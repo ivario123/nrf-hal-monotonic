@@ -31,6 +31,7 @@ version = "0.2.3"
 [features]
 doc = []
 rt = ["nrf52832-pac/rt"]
+monotonic = ["nrf-hal-common/monotonic"]
 xxAA-package = []
 xxAB-package = []
 
