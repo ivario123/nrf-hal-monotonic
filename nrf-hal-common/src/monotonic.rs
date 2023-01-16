@@ -39,12 +39,12 @@ impl<T: Mono> MonotonicTimer<T> {
     ///
     /// See documentation for [`rtic_monotonic`]
     /// for more information.
-    pub fn new(overflow: u8, _timer: T) -> Self {
+    pub fn new(_timer: T) -> Self {
         unsafe {
             T::init();
         }
         Self {
-            overflow,
+            overflow: 0,
             timer: PhantomData,
         }
     }
