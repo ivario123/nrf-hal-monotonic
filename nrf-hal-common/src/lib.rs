@@ -112,7 +112,7 @@ pub mod uicr;
 #[cfg(feature = "nrf-usbd")]
 pub mod usbd;
 pub mod wdt;
-//#[cfg(feature = "monotonic")]
+#[cfg(feature = "monotonic")]
 pub mod monotonic;
 
 pub mod prelude {
