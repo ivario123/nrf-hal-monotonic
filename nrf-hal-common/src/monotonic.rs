@@ -74,33 +74,48 @@ use rtic_monotonic::Monotonic;
 use core::marker::PhantomData;
 use core::ops::{ Add, Sub };
 use fugit;
+use ilog::IntLog;
+
+/// The errors that can occur when using the [`MonotonicTimer`]
+pub enum Error {
+    /// There is no way of achieving the requested frequency.
+    ///
+    /// The prescaler size depends on wether the timer is a TIMER or a RTC.
+    /// - TIMER: 4 bits
+    /// - RTC: 12 bits
+    InvalidFrequency(u32),
+}
 
 /// Implementors of this trait can be used as sources for the [`MonotonicTimer`].
 pub trait Mono {
-    /// The register type
+    /// The base frequency of the underlying clock
+    ///
+    /// - RTC: 32_768 Hz
+    /// - TIMER: 16_000_000 Hz
+    const BASE_FREQ: u32;
+    /// The type of the underlying register
     type RegPtr: Sized;
-    /// The instant type
-    type Instant: Ord +
-        Copy +
-        Add<Self::Duration, Output = Self::Instant> +
-        Sub<Self::Duration, Output = Self::Instant> +
-        Sub<Self::Instant, Output = Self::Duration>;
-    /// The duration type
-    type Duration;
+    /// Checks if the requested frequency is valid
+    /// Returns the prescaler value and the actual frequency
+    /// Returns [`Error::InvalidFrequency`] if the frequency is not valid
+    fn check_freq(freq: u32) -> Result<(u32, u32), Error>;
     /// Returns a reference to the underlying register
     unsafe fn reg<'a>() -> &'a Self::RegPtr;
     /// Sets the clock freq
-    unsafe fn init();
+    unsafe fn init<const FREQ: u32>() -> Result<u32, Error>;
     /// Returns the current clock count
-    unsafe fn now(overflow: &mut u8) -> Self::Instant;
+    unsafe fn now<const FREQ: u32>(overflow: &mut u8) -> fugit::TimerInstantU32<FREQ>;
     /// Sets the comparison value
-    unsafe fn set_compare(instant: Self::Instant, overflow: &mut u8);
+    unsafe fn set_compare<const FREQ: u32>(
+        instant: fugit::TimerInstantU32<FREQ>,
+        overflow: &mut u8
+    );
     /// Clears the comparison flag
     unsafe fn clear_compare_flag();
     /// Sets the clock to 0 and clears all pending interrupts
     unsafe fn reset();
     /// Returns zero.
-    unsafe fn zero() -> Self::Instant;
+    unsafe fn zero<const FREQ: u32>() -> fugit::TimerInstantU32<FREQ>;
 }
 
 /// Monotonic Timer
@@ -108,7 +123,7 @@ pub trait Mono {
 ///
 /// Wrapper that allows the usage of the [`timer`](crate::timer)'s or [`rtc`](crate::rtc)'s
 /// as [`rtic_monotonic`] timers for use in real time applications.
-pub struct MonotonicTimer<T: Mono> {
+pub struct MonotonicTimer<T: Mono, const FREQ: u32> {
     timer: PhantomData<T>,
     overflow: u8,
 }
@@ -116,9 +131,9 @@ pub struct MonotonicTimer<T: Mono> {
 /// Blanket [`Monotonic`] implementation
 /// This is just a frontend, allowing the backend implementations
 /// to handle all the different register accesses needed.
-impl<T: Mono> Monotonic for MonotonicTimer<T> {
-    type Instant = T::Instant;
-    type Duration = T::Duration;
+impl<T: Mono, const FREQ: u32> Monotonic for MonotonicTimer<T, FREQ> {
+    type Instant = fugit::TimerInstantU32<FREQ>;
+    type Duration = fugit::TimerDurationU32<FREQ>;
 
     fn now(&mut self) -> Self::Instant {
         unsafe { T::now(&mut self.overflow) }
@@ -159,23 +174,23 @@ macro_rules! timers {
     ) => {
         $(
             $(#[$feature_gate])?
-            impl MonotonicTimer<$timer> {
+            impl<const FREQ:u32> MonotonicTimer<$timer,FREQ> {
                 /// Creates a new [`MonotonicTimer`] using the given [`timer`](crate::timer) and [`clocks`](crate::clocks).
                 /// The timer will be configured to run at 1 MHz.
-                pub fn new<H, L, LfOsc>(_timer: $timer, _clocks: &crate::clocks::Clocks<H, L, LfOsc>) -> Self {
+                pub fn new<H, L, LfOsc>(_timer: $timer, _clocks: &crate::clocks::Clocks<H, L, LfOsc>) -> Result<Self,Error> {
                     unsafe {
-                        $timer::init();
+                        $timer::init::<FREQ>()?;
                     }
-                    Self {
+                    Ok(Self {
                         overflow: 0,
                         timer: PhantomData,
-                    }
+                    })
                 }
             }
+            
             $(#[$feature_gate])?
                 impl Mono for $timer {
-                    type Instant = fugit::TimerInstantU32<1_000_000>;
-                    type Duration = fugit::TimerDurationU32<1_000_000>;
+                    const BASE_FREQ: u32 = 16_000_000;
                     type RegPtr = $reg_block;
 
                     #[inline(always)]
@@ -183,18 +198,32 @@ macro_rules! timers {
                         &*$timer::PTR
                     }
 
+                    /// Checks if the requested frequency is valid
+                    /// returns the prescaler value and the actual freq
+                    /// if it is returns an error if it is not
+                    fn check_freq(freq: u32) -> Result<(u32,u32), Error> {
+                        let prescaler = (Self::BASE_FREQ / freq).log2() as u32 - 1;
+                        match prescaler {
+                            _ if prescaler*freq != Self::BASE_FREQ => Err(Error::InvalidFrequency(freq)),
+                            0..=0xFFFF => Ok((prescaler, Self::BASE_FREQ / prescaler)),
+                            _ => Err(Error::InvalidFrequency(freq)),
+                        }
+                    }
+
                     /// Configures the timer to run at 1 MHz, with a 32 bit counter.
                     /// This means that it will overflow after `2^32 / 1_000_000 = 4295` seconds.
                     /// 
                     /// See [§6.30](https://infocenter.nordicsemi.com/pdf/nRF52840_PS_v1.7.pdf#%5B%7B%22num%22%3A4382%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C85.039%2C388.185%2Cnull%5D) in
                     /// the nRF52840 Product Specification for more information.
-                    unsafe fn init() {
+                    unsafe fn init<const FREQ:u32>() -> Result<u32,Error> {
                         let timer = Self::reg();
-                        timer.prescaler.write(|w| w.prescaler().bits(4)); // 1 MHz
-                        timer.bitmode.write(|w| w.bitmode()._32bit());   
+                        let pre = Self::check_freq(FREQ)?;
+                        timer.prescaler.write(|w| w.prescaler().bits(pre.0 as u8));
+                        timer.bitmode.write(|w| w.bitmode()._32bit());
+                        Ok(pre.1)
                     }
 
-                    unsafe fn now(_:&mut u8) -> Self::Instant {
+                    unsafe fn now<const FREQ:u32>(_overflow: &mut u8) -> fugit::TimerInstantU32<FREQ> {
                         let timer = Self::reg();
                         timer.tasks_capture[1].write(|w| w.bits(1));
                         fugit::TimerInstantU32::from_ticks(timer.cc[1].read().bits())
@@ -206,7 +235,7 @@ macro_rules! timers {
                     /// - 0 if the target value is in the past or will overflow
                     /// 
                     /// This is done to prevent the timer from overflowing.
-                    unsafe fn set_compare(instant: Self::Instant,overflow:&mut u8) {
+                    unsafe fn set_compare<const FREQ:u32>(instant: fugit::TimerInstantU32<FREQ>,overflow:&mut u8) {
                         let target = match instant.checked_duration_since(Self::now(overflow)) {
                             Some(time)  => time.ticks(),// In the future
                             None        => 0            // In the past
@@ -225,7 +254,7 @@ macro_rules! timers {
                         timer.tasks_start.write(|w| w.bits(1)); // Start the timer
                     }
 
-                    unsafe fn zero() -> Self::Instant{
+                    unsafe fn zero<const FREQ:u32>() -> fugit::TimerInstantU32<FREQ>{
                         fugit::TimerInstantU32::from_ticks(0) // Return zero
                     }
                 }
@@ -243,37 +272,51 @@ macro_rules! rtcs {
     ) => {
         $(
             $( #[$feature_gate] )?
-            impl MonotonicTimer<$rtc> {
+            impl<const FREQ:u32> MonotonicTimer<$rtc,FREQ> {
                 /// Creates a new [`MonotonicTimer`] using the given [`rtc`](crate::rtc) and [`clocks`](crate::clocks)
                 /// 
                 /// To use the RTC as a monotonic timer, the LFCLK must be running [§6.22](https://infocenter.nordicsemi.com/pdf/nRF52840_PS_v1.7.pdf#%5B%7B%22num%22%3A4356%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C85.039%2C566.023%2Cnull%5D).
-                pub fn new<H, L>(_timer: $rtc, _clocks: &crate::clocks::Clocks<H, L, crate::clocks::LfOscStarted>) -> Self {
+                pub fn new<H, L>(_timer: $rtc, _clocks: &crate::clocks::Clocks<H, L, crate::clocks::LfOscStarted>) -> Result<Self,Error> {
                     unsafe {
-                        $rtc::init();
+                        $rtc::init::<FREQ>()?;
                     }
-                    Self {
+                    Ok(Self {
                         overflow: 0,
                         timer: PhantomData,
-                    }
+                    })
                 }
             }
             $( #[$feature_gate] )?
             impl Mono for $rtc {
-                type Instant = fugit::TimerInstantU32<{crate::clocks::LFCLK_FREQ}>;
-                type Duration = fugit::TimerDurationU32<{crate::clocks::LFCLK_FREQ}>;
+                const BASE_FREQ : u32 = crate::clocks::LFCLK_FREQ;
                 type RegPtr = RtcRegisterBlock;
 
                 #[inline(always)]
                 unsafe fn reg<'a>() -> &'a Self::RegPtr {
                     &*$rtc::PTR
                 }
+                /// Checks if the requested frequency is valid
+                /// returns the prescaler value and the actual freq
+                /// if it is returns an error if it is not
+                fn check_freq(freq: u32) -> Result<(u32,u32), Error> {
+                    let prescaler = Self::BASE_FREQ / freq;
+                    // Checks that the prescaler fits in 12 bits
+                    match prescaler {
+                        0 => Err(Error::InvalidFrequency(freq)),
+                        _ if prescaler*freq != Self::BASE_FREQ => Err(Error::InvalidFrequency(freq)),
+                        _ if prescaler > (1 << 12) => Err(Error::InvalidFrequency(freq)),
+                        _ => Ok((prescaler,Self::BASE_FREQ / prescaler)),
+                    }
+                }
                 /// Initializes the rtc to run at 32_768 hz
-                unsafe fn init() {
+                unsafe fn init<const FREQ:u32>() -> Result<u32,Error> {
                     let timer = Self::reg();
-                    timer.prescaler.write(|w| w.bits(0)); // No prescaler
+                    let pre = Self::check_freq(FREQ)?;
+                    timer.prescaler.write(|w| w.bits(pre.0)); // No prescaler
+                    Ok(pre.1)
                 }
 
-                unsafe fn now(overflow: &mut u8) -> Self::Instant{
+                unsafe fn now<const FREQ:u32>(overflow: &mut u8) -> fugit::TimerInstantU32<FREQ>{
                     
                     let timer = Self::reg();
                     let cnt = timer.counter.read().bits();
@@ -301,7 +344,7 @@ macro_rules! rtcs {
                 /// 
                 /// ## Credit
                 /// This is lifted straight from [https://gist.github.com/korken89/fe94a475726414dd1bce031c76adc3dd]
-                unsafe fn set_compare(instant:Self::Instant, overflow: &mut u8) {
+                unsafe fn set_compare<const FREQ:u32>(instant:fugit::TimerInstantU32<FREQ>, overflow: &mut u8) {
                     let now = Self::now(overflow);
 
                     const MIN_TICKS_FOR_COMPARE: u32 = 3;
@@ -338,7 +381,7 @@ macro_rules! rtcs {
                     timer.tasks_start.write(|w| w.bits(1));
                 }
 
-                unsafe fn zero() -> Self::Instant{
+                unsafe fn zero<const FREQ:u32>() -> fugit::TimerInstantU32<FREQ>{
                     fugit::TimerInstantU32::from_ticks(0)
                 }
             }
