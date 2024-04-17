@@ -3,6 +3,8 @@
 
 #![doc(html_root_url = "https://docs.rs/nrf-hal-common/0.17.0")]
 #![no_std]
+#![feature(noop_waker)]
+
 
 #[cfg(feature = "51")]
 pub use nrf51_pac as pac;
@@ -91,6 +93,8 @@ pub mod spi;
 pub mod spim;
 #[cfg(not(feature = "51"))]
 pub mod spis;
+#[cfg(not(feature = "51"))]
+pub mod spis_async;
 #[cfg(not(any(feature = "9160", feature = "5340-app")))]
 pub mod temp;
 pub mod time;

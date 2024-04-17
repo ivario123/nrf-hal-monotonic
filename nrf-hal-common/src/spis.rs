@@ -3,8 +3,10 @@
 //! A module for SPI communication in peripheral mode.
 
 use core::{
+    future::{poll_fn, Future, IntoFuture, PollFn},
     ops::Deref,
     sync::atomic::{compiler_fence, Ordering},
+    task::{Context, Poll},
 };
 
 #[cfg(any(feature = "9160", feature = "5340-app", feature = "5340-net"))]
@@ -489,7 +491,19 @@ struct InnerSplit<T: Instance, TxB, RxB> {
     spis: Spis<T>,
 }
 
+impl IntoFuture for () {
+
+}
+
 impl<T: Instance, TxB, RxB> TransferSplit<T, TxB, RxB> {
+    pub fn register_listener(&self) -> Poll<()> {
+        let ptr = unsafe { &*T::PTR };
+        if ptr.events_end.read().bits() != 0 || ptr.events_endrx.read().bits() != 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
     /// Blocks until the transfer is done and returns the buffer.
     pub fn wait(mut self) -> (TxB, RxB, Spis<T>) {
         compiler_fence(Ordering::SeqCst);
@@ -635,6 +649,7 @@ mod sealed {
 
 pub trait Instance: sealed::Sealed + Deref<Target = spis0::RegisterBlock> {
     const INTERRUPT: Interrupt;
+    const PTR: *const nrf52840_pac::spis0::RegisterBlock;
 }
 
 impl Instance for SPIS0 {
@@ -646,6 +661,7 @@ impl Instance for SPIS0 {
         feature = "52810"
     )))]
     const INTERRUPT: Interrupt = Interrupt::SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0;
+    const PTR: *const nrf52840_pac::spis0::RegisterBlock = SPIS0::PTR;
     #[cfg(feature = "9160")]
     const INTERRUPT: Interrupt = Interrupt::UARTE0_SPIM0_SPIS0_TWIM0_TWIS0;
     #[cfg(any(feature = "5340-app", feature = "5340-net"))]
@@ -665,6 +681,7 @@ impl Instance for SPIS0 {
 impl Instance for SPIS1 {
     #[cfg(not(feature = "52811"))]
     const INTERRUPT: Interrupt = Interrupt::SPIM1_SPIS1_TWIM1_TWIS1_SPI1_TWI1;
+    const PTR: *const nrf52840_pac::spis0::RegisterBlock = SPIS1::PTR;
     #[cfg(feature = "52811")]
     const INTERRUPT: Interrupt = Interrupt::SPIM1_SPIS1_SPI1;
 }
@@ -678,4 +695,5 @@ impl Instance for SPIS1 {
 )))]
 impl Instance for SPIS2 {
     const INTERRUPT: Interrupt = Interrupt::SPIM2_SPIS2_SPI2;
+    const PTR: *const nrf52840_pac::spis0::RegisterBlock = SPIS2::PTR;
 }

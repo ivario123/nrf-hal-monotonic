@@ -27,6 +27,7 @@ rand_core = "0.6.4"
 cfg-if = "1.0.0"
 embedded-dma = "0.2.0"
 embedded-storage = "0.3.1"
+rtic-common = "1.0.0"
 
 [dependencies.void]
 default-features = false
@@ -85,11 +86,15 @@ optional = true
 [dependencies.embedded-hal]
 version = "1.0.0"
 
+[dependencies.embedded-hal-async]
+version = "1.0.0"
+
 [dependencies.embedded-io]
 version = "0.6.1"
 
 [features]
 doc = []
+default = ["52840"]
 51 = ["nrf51-pac"]
 52810 = ["nrf52810-pac"]
 52811 = ["nrf52811-pac"]
