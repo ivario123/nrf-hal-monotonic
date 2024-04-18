@@ -1,5 +1,8 @@
 #![macro_use]
-use core::{future::poll_fn, marker::PhantomData, sync::atomic::compiler_fence, task::Poll};
+use core::{
+    future::poll_fn, hint::unreachable_unchecked, marker::PhantomData,
+    sync::atomic::compiler_fence, task::Poll,
+};
 use embedded_hal_async::spi::*;
 use nrf52840_pac::spis0;
 use spis0::config::ORDER_A as Bitorder;
@@ -9,20 +12,30 @@ use crate::{
     target_constants::EASY_DMA_SIZE,
 };
 
-use self::sealed::Instance;
+use self::sealed::{Argument, Instance, Setters};
 
 /// This type will litter the codebase.
 type P = Pin<Input<Floating>>;
 
-pub enum Pins<const HasCs: bool, const Rx: bool, const Tx: bool> {
+/// Enumerates the errors that the async spi can throw.
+pub enum Error {
+    /// Thrown when the buffer does not fit in to the dma buffer.
+    BufferTooLarget { requested: usize, max: usize },
+
+    /// Thrown when the reading procedure somehow read more bytes
+    /// than what the buffer can store.
+    BufferOverRun(usize),
+}
+
+pub enum Pins<const HAS_CS: bool, const RX: bool, const TX: bool> {
     /// only capable of recieving data.
-    Rx {
+    RX {
         mosi: P,
         clock: P,
         chip_select: Option<P>,
     },
     /// Only capable of transmitting data.
-    Tx {
+    TX {
         miso: P,
         clock: P,
         chip_select: Option<P>,
@@ -53,89 +66,133 @@ pub struct Config {
     pub auto_acquire: bool,
 }
 
-pub struct Spi<I: Instance, const Tx: bool, const Rx: bool, const Cs: bool, const BufferSize: usize>
+pub struct Spi<I: Instance, const TX: bool, const RX: bool, const CS: bool, const BUFFERSIZE: usize>
 {
     instance: PhantomData<I>,
-    tx: Option<*const [u8; BufferSize]>,
-    rx: Option<*const [u8; BufferSize]>,
+    tx: Option<*mut [u8; BUFFERSIZE]>,
+    rx: Option<*const [u8; BUFFERSIZE]>,
 }
 
-impl<I: Instance, const Cs: bool, const BufferSize: usize> Spi<I, true, false, Cs, BufferSize> {
-    pub fn new(
+impl<I: Instance, const CS: bool, const TX: bool, const RX: bool, const BUFFERSIZE: usize>
+    Spi<I, TX, RX, CS, BUFFERSIZE>
+{
+    pub fn new<A: Argument<BUFFERSIZE>>(
         mut spi: I,
-        pins: Pins<Cs, false, true>,
-        tx_buffer: *const [u8; BufferSize],
+        arguments: A,
         config: Config,
-    ) -> Self {
-        if BufferSize > EASY_DMA_SIZE {
-            panic!()
+    ) -> Result<Self, Error> {
+        if BUFFERSIZE > EASY_DMA_SIZE {
+            return Err(Error::BufferTooLarget {
+                requested: BUFFERSIZE,
+                max: EASY_DMA_SIZE,
+            });
         }
-        pins.configure(&mut spi);
-        config.apply(&mut spi);
-
-        let spi = spi.spi();
-        spi.enable.write(|w| w.enable().enabled());
-
-        Spi {
-            instance: PhantomData,
-            tx: Some(tx_buffer),
-            rx: None,
-        }
-    }
-}
-
-impl<I: Instance, const Cs: bool, const BufferSize: usize> Spi<I, false, true, Cs, BufferSize> {
-    pub fn new(
-        mut spi: I,
-        pins: Pins<Cs, true, false>,
-        rx_buffer: *const [u8; BufferSize],
-        config: Config,
-    ) -> Self {
-        if BufferSize > EASY_DMA_SIZE {
-            panic!()
-        }
-        pins.configure(&mut spi);
-        config.apply(&mut spi);
-
-        let spi = spi.spi();
-        spi.enable.write(|w| w.enable().enabled());
-
-        Spi {
+        let mut ret = Spi {
             instance: PhantomData,
             tx: None,
-            rx: Some(rx_buffer),
-        }
-    }
-}
-
-impl<I: Instance, const Cs: bool, const BufferSize: usize> Spi<I, true, true, Cs, BufferSize> {
-    pub fn new(
-        mut spi: I,
-        pins: Pins<Cs, true, true>,
-        tx_buffer: *const [u8; BufferSize],
-        rx_buffer: *const [u8; BufferSize],
-        config: Config,
-    ) -> Self {
-        if BufferSize > EASY_DMA_SIZE {
-            panic!()
-        }
-        pins.configure(&mut spi);
+            rx: None,
+        };
+        arguments.apply(&mut ret, &mut spi);
         config.apply(&mut spi);
-        let spi = spi.spi();
 
+        let spi = spi.spi();
         spi.enable.write(|w| w.enable().enabled());
 
-        Spi {
-            instance: PhantomData,
-            tx: Some(tx_buffer),
-            rx: Some(rx_buffer),
-        }
+        Ok(ret)
     }
 }
+//
+// impl<I: Instance, const CS: bool, const BUFFERSIZE: usize> Spi<I, true, false, CS, BUFFERSIZE> {
+//     const _BOUNDS_CHECK: () = assert!(BUFFERSIZE <= EASY_DMA_SIZE);
+//     pub fn new(
+//         mut spi: I,
+//         pins: Pins<CS, false, true>,
+//         tx_buffer: *mut [u8; BUFFERSIZE],
+//         config: Config,
+//     ) -> Result<Self, Error> {
+//         if BUFFERSIZE > EASY_DMA_SIZE {
+//             return Err(Error::BufferTooLarget {
+//                 requested: BUFFERSIZE,
+//                 max: EASY_DMA_SIZE,
+//             });
+//         }
+//         pins.configure(&mut spi);
+//         config.apply(&mut spi);
+//
+//         let spi = spi.spi();
+//         spi.enable.write(|w| w.enable().enabled());
+//
+//         Ok(Spi {
+//             instance: PhantomData,
+//             tx: Some(tx_buffer),
+//             rx: None,
+//         })
+//     }
+// }
+//
+// impl<I: Instance, const CS: bool, const BUFFERSIZE: usize> Spi<I, false, true, CS, BUFFERSIZE> {
+//     const _BOUNDS_CHECK: () = assert!(BUFFERSIZE <= EASY_DMA_SIZE);
+//     pub fn new(
+//         mut spi: I,
+//         pins: Pins<CS, true, false>,
+//         rx_buffer: *const [u8; BUFFERSIZE],
+//         config: Config,
+//     ) -> Result<Self, Error> {
+//         if BUFFERSIZE > EASY_DMA_SIZE {
+//             return Err(Error::BufferTooLarget {
+//                 requested: BUFFERSIZE,
+//                 max: EASY_DMA_SIZE,
+//             });
+//         }
+//         pins.configure(&mut spi);
+//         config.apply(&mut spi);
+//
+//         let spi = spi.spi();
+//         spi.enable.write(|w| w.enable().enabled());
+//
+//         Ok(Spi {
+//             instance: PhantomData,
+//             tx: None,
+//             rx: Some(rx_buffer),
+//         })
+//     }
+// }
+//
+// impl<I: Instance, const CS: bool, const BUFFERSIZE: usize> Spi<I, true, true, CS, BUFFERSIZE> {
+//     const _BOUNDS_CHECK: () = assert!(BUFFERSIZE <= EASY_DMA_SIZE);
+//     pub fn new(
+//         mut spi: I,
+//         pins: Pins<CS, true, true>,
+//         tx_buffer: *mut [u8; BUFFERSIZE],
+//         rx_buffer: *const [u8; BUFFERSIZE],
+//         config: Config,
+//     ) -> Result<Self, Error> {
+//         if BUFFERSIZE > EASY_DMA_SIZE {
+//             return Err(Error::BufferTooLarget {
+//                 requested: BUFFERSIZE,
+//                 max: EASY_DMA_SIZE,
+//             });
+//         }
+//         pins.configure(&mut spi);
+//         config.apply(&mut spi);
+//         let spi = spi.spi();
+//
+//         spi.enable.write(|w| w.enable().enabled());
+//
+//         Ok(Spi {
+//             instance: PhantomData,
+//             tx: Some(tx_buffer),
+//             rx: Some(rx_buffer),
+//         })
+//     }
+// }
 
-impl<I: Instance, const Cs: bool, const Rx: bool, const BufferSize: usize>
-    Spi<I, true, Rx, Cs, BufferSize>
+// SECTION: Inner helpers.
+impl<I: Instance, const CS: bool, const TX: bool, const RX: bool, const BUFFERSIZE: usize>
+    Spi<I, TX, RX, CS, BUFFERSIZE>
 {
+    /// heavily inspired by https://github.com/embassy-rs/embassy/blob/main/embassy-nrf/src/spis.rs
+    /// More or less lifted straight from it.
     async fn inner(&mut self) -> (usize, usize) {
         let r = I::const_spi();
         let s = I::state();
@@ -186,24 +243,72 @@ impl<I: Instance, const Cs: bool, const Rx: bool, const BufferSize: usize>
         (n_rx, n_tx)
     }
 
+    // Acquires the semaphore.
+    async fn lock(&self) {
+        let spi = I::const_spi();
+        let waker = I::state();
+        // Acquire semaphore.
+        if spi.semstat.read().bits() != 1 {
+            // Reset and enable the acquire event.
+            spi.events_acquired.reset();
+            spi.intenset.write(|w| w.acquired().set());
+
+            // Request acquiring the SPIS semaphore.
+            spi.tasks_acquire.write(|w| unsafe { w.bits(1) });
+
+            // Wait until CPU has acquired the semaphore.
+            poll_fn(|cx| {
+                waker.waker.register(cx.waker());
+                if spi.events_acquired.read().bits() == 1 {
+                    spi.events_acquired.reset();
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
+        }
+    }
+
+    // Acquires the semaphore.
+    async fn locked<F: FnOnce() -> ()>(&self, callable: F) {
+        self.lock().await;
+        callable();
+        self.release();
+    }
+
+    // Releases the semaphore.
+    fn release(&self) {
+        let spi = I::const_spi();
+        spi.tasks_release.write(|w| unsafe { w.bits(1) });
+    }
+
+    /// heavily inspired by https://github.com/embassy-rs/embassy/blob/main/embassy-nrf/src/spis.rs
+    /// More or less lifted straight from it.
     fn prepare(&mut self) {
         let r = I::const_spi();
 
-        // Set up the DMA write.
-        let ptr = self.tx.unwrap_or_else(|| panic!());
+        if TX {
+            // Set up the DMA write.
+            let ptr = self
+                .tx
+                .unwrap_or_else(|| unsafe { unreachable_unchecked() });
 
-        r.txd.ptr.write(|w| unsafe { w.ptr().bits(ptr as _) });
-        r.txd
-            .maxcnt
-            .write(|w| unsafe { w.maxcnt().bits(BufferSize as _) });
+            r.txd.ptr.write(|w| unsafe { w.ptr().bits(ptr as _) });
+            r.txd
+                .maxcnt
+                .write(|w| unsafe { w.maxcnt().bits(BUFFERSIZE as _) });
+        }
+        if RX {
+            // Set up the DMA read.
+            let ptr = self
+                .rx
+                .unwrap_or_else(|| unsafe { unreachable_unchecked() });
 
-        // Set up the DMA read.
-        let ptr = self.rx.unwrap_or_else(|| panic!());
-
-        r.txd.ptr.write(|w| unsafe { w.ptr().bits(ptr as _) });
-        r.txd
-            .maxcnt
-            .write(|w| unsafe { w.maxcnt().bits(BufferSize as _) });
+            r.rxd.ptr.write(|w| unsafe { w.ptr().bits(ptr as _) });
+            r.rxd
+                .maxcnt
+                .write(|w| unsafe { w.maxcnt().bits(BUFFERSIZE as _) });
+        }
 
         // Reset end event.
         r.events_end.reset();
@@ -213,10 +318,100 @@ impl<I: Instance, const Cs: bool, const Rx: bool, const BufferSize: usize>
     }
 }
 
+impl<I: Instance, const CS: bool, const TX: bool, const BUFFERSIZE: usize>
+    Spi<I, TX, true, CS, BUFFERSIZE>
+{
+    pub async fn read(&mut self) -> Result<(usize, [u8; BUFFERSIZE]), Error> {
+        let read_bytes = self.inner().await.0;
+        // This should not possibly happen.
+        if read_bytes > BUFFERSIZE {
+            return Err(Error::BufferOverRun(read_bytes));
+        }
+
+        let mut ret_buff = [0; BUFFERSIZE];
+
+        self.locked(|| {
+            // Get the buffer from the DMA and return a clone of it to the user.
+            let rx = unsafe { *self.rx.unwrap_or_else(|| unreachable_unchecked()) };
+            ret_buff.copy_from_slice(&rx);
+        })
+        .await;
+
+        Ok((read_bytes, ret_buff))
+    }
+}
+
+impl<I: Instance, const CS: bool, const RX: bool, const BUFFERSIZE: usize>
+    Spi<I, true, RX, CS, BUFFERSIZE>
+{
+    pub async fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        self.locked(|| {
+            // Move the data from the buffer in to the DMA buffer.
+            let tx: &mut [u8; BUFFERSIZE] =
+                unsafe { &mut *self.tx.unwrap_or_else(|| unreachable_unchecked()) };
+            tx.copy_from_slice(data)
+        })
+        .await;
+
+        let written_bytes = self.inner().await.1;
+
+        Ok(written_bytes)
+    }
+}
+
+impl<I: Instance, const CS: bool, const BUFFERSIZE: usize> Spi<I, true, true, CS, BUFFERSIZE> {
+    pub async fn transfer(
+        &mut self,
+        data: &[u8],
+    ) -> Result<((usize, usize), [u8; BUFFERSIZE]), Error> {
+        self.locked(|| {
+            // Move the data from the buffer in to the DMA buffer.
+            let tx: &mut [u8; BUFFERSIZE] =
+                unsafe { &mut *self.tx.unwrap_or_else(|| unreachable_unchecked()) };
+            tx.copy_from_slice(data)
+        })
+        .await;
+
+        let (read_bytes, written_bytes) = self.inner().await;
+
+        // This should not possibly happen.
+        if read_bytes > BUFFERSIZE {
+            return Err(Error::BufferOverRun(read_bytes));
+        }
+
+        let mut ret_buff = [0; BUFFERSIZE];
+
+        self.locked(|| {
+            // Get the buffer from the DMA and return a clone of it to the user.
+            let rx = unsafe { *self.rx.unwrap_or_else(|| unreachable_unchecked()) };
+            ret_buff.copy_from_slice(&rx);
+        })
+        .await;
+
+        Ok(((read_bytes, written_bytes), ret_buff))
+    }
+}
+
+impl<I: Instance, const CS: bool, const TX: bool, const RX: bool, const BUFFERSIZE: usize>
+    Setters<BUFFERSIZE> for Spi<I, TX, RX, CS, BUFFERSIZE>
+{
+    fn underlying(&self) -> &spis0::RegisterBlock {
+        I::const_spi()
+    }
+    fn set_rx_buff(&mut self, ptr: *const [u8; BUFFERSIZE]) {
+        self.rx = Some(ptr)
+    }
+    fn set_tx_buff(&mut self, ptr: *mut [u8; BUFFERSIZE]) {
+        self.tx = Some(ptr)
+    }
+}
+
 mod sealed {
     use rtic_common::waker_registration::CriticalSectionWakerRegistration;
 
     use crate::pac::spis0;
+
+    use super::Pins;
 
     pub struct State {
         pub waker: CriticalSectionWakerRegistration,
@@ -259,6 +454,57 @@ mod sealed {
         };
     }
     spi!(SPIS0, SPIS1, SPIS2);
+
+    pub trait Setters<const BUFFERSIZE: usize> {
+        fn set_rx_buff(&mut self, ptr: *const [u8; BUFFERSIZE]);
+        fn set_tx_buff(&mut self, ptr: *mut [u8; BUFFERSIZE]);
+        fn underlying(&self) -> &spis0::RegisterBlock;
+    }
+    pub trait Argument<const BUFFERSIZE: usize> {
+        fn apply<I: Setters<BUFFERSIZE>, S: Instance>(&self, instance: &mut I, source: &mut S);
+    }
+
+    impl<const CS: bool, const BUFFERSIZE: usize> Argument<BUFFERSIZE>
+        for (
+            Pins<CS, true, true>,
+            // TX Buffer
+            *mut [u8; BUFFERSIZE],
+            // RX Buffer
+            *const [u8; BUFFERSIZE],
+        )
+    {
+        fn apply<I: Setters<BUFFERSIZE>, S: Instance>(&self, instance: &mut I, source: &mut S) {
+            self.0.configure(source);
+            instance.set_rx_buff(self.2);
+            instance.set_tx_buff(self.1);
+        }
+    }
+
+    impl<const CS: bool, const BUFFERSIZE: usize> Argument<BUFFERSIZE>
+        for (
+            Pins<CS, true, false>,
+            // TX Buffer
+            *mut [u8; BUFFERSIZE],
+        )
+    {
+        fn apply<I: Setters<BUFFERSIZE>, S: Instance>(&self, instance: &mut I, source: &mut S) {
+            self.0.configure(source);
+            instance.set_tx_buff(self.1)
+        }
+    }
+
+    impl<const CS: bool, const BUFFERSIZE: usize> Argument<BUFFERSIZE>
+        for (
+            Pins<CS, false, true>,
+            // RX Buffer
+            *const [u8; BUFFERSIZE],
+        )
+    {
+        fn apply<I: Setters<BUFFERSIZE>, S: Instance>(&self, instance: &mut I, source: &mut S) {
+            self.0.configure(source);
+            instance.set_rx_buff(self.1)
+        }
+    }
 }
 
 impl Default for Config {
@@ -309,22 +555,26 @@ impl Config {
     }
 }
 
-impl<const Rx: bool, const Tx: bool> Pins<false, Rx, Tx> {
-    pub fn rx(clock: P, mosi: P) -> Pins<false, true, false> {
-        Pins::Rx {
+impl Pins<false, true, false> {
+    pub fn rx(clock: P, mosi: P) -> Self {
+        Pins::RX {
             mosi,
             clock,
             chip_select: None,
         }
     }
-    pub fn tx(clock: P, miso: P) -> Pins<false, false, true> {
-        Pins::Tx {
+}
+impl Pins<false, false, true> {
+    pub fn tx(clock: P, miso: P) -> Self {
+        Pins::TX {
             miso,
             clock,
             chip_select: None,
         }
     }
-    pub fn duplex(clock: P, miso: P, mosi: P) -> Pins<false, true, true> {
+}
+impl Pins<false, true, true> {
+    pub fn duplex(clock: P, miso: P, mosi: P) -> Self {
         Pins::Duplex {
             miso,
             mosi,
@@ -334,22 +584,26 @@ impl<const Rx: bool, const Tx: bool> Pins<false, Rx, Tx> {
     }
 }
 
-impl<const Rx: bool, const Tx: bool> Pins<true, Rx, Tx> {
-    pub fn rx(clock: P, mosi: P, cs: P) -> Pins<true, true, false> {
-        Pins::Rx {
+impl Pins<true, true, false> {
+    pub fn rx_cs(clock: P, mosi: P, cs: P) -> Self {
+        Pins::RX {
             mosi,
             clock,
             chip_select: Some(cs),
         }
     }
-    pub fn tx(clock: P, miso: P, cs: P) -> Pins<true, false, true> {
-        Pins::Tx {
+}
+impl Pins<true, false, true> {
+    pub fn tx_cs(clock: P, miso: P, cs: P) -> Self {
+        Pins::TX {
             miso,
             clock,
             chip_select: Some(cs),
         }
     }
-    pub fn duplex(clock: P, miso: P, mosi: P, cs: P) -> Pins<true, true, true> {
+}
+impl Pins<true, true, true> {
+    pub fn duplex_cs(clock: P, miso: P, mosi: P, cs: P) -> Self {
         Pins::Duplex {
             miso,
             mosi,
@@ -359,16 +613,16 @@ impl<const Rx: bool, const Tx: bool> Pins<true, Rx, Tx> {
     }
 }
 
-impl<const Cs: bool, const Rx: bool, const Tx: bool> Pins<Cs, Rx, Tx> {
+impl<const CS: bool, const RX: bool, const TX: bool> Pins<CS, RX, TX> {
     fn configure_cs<I: Instance>(&self, instance: &mut I) {
-        if Cs {
+        if CS {
             let cs = match self {
-                Self::Rx {
+                Self::RX {
                     mosi: _,
                     clock: _,
                     chip_select,
                 } => chip_select.as_ref().unwrap_or_else(|| unreachable!()),
-                Self::Tx {
+                Self::TX {
                     miso: _,
                     clock: _,
                     chip_select,
@@ -389,16 +643,16 @@ impl<const Cs: bool, const Rx: bool, const Tx: bool> Pins<Cs, Rx, Tx> {
     }
 }
 
-impl<const Cs: bool, const Rx: bool, const Tx: bool> Pins<Cs, Rx, Tx> {
+impl<const CS: bool, const RX: bool, const TX: bool> Pins<CS, RX, TX> {
     fn configure_mosi<I: Instance>(&self, instance: &mut I) {
-        if Rx {
+        if RX {
             let mosi = match self {
-                Self::Rx {
+                Self::RX {
                     mosi,
                     clock: _,
                     chip_select: _,
                 } => mosi,
-                Self::Tx {
+                Self::TX {
                     miso: _,
                     clock: _,
                     chip_select: _,
@@ -419,16 +673,16 @@ impl<const Cs: bool, const Rx: bool, const Tx: bool> Pins<Cs, Rx, Tx> {
     }
 }
 
-impl<const Cs: bool, const Rx: bool, const Tx: bool> Pins<Cs, Rx, Tx> {
+impl<const CS: bool, const RX: bool, const TX: bool> Pins<CS, RX, TX> {
     fn configure_miso<I: Instance>(&self, instance: &mut I) {
-        if Tx {
+        if TX {
             let miso = match self {
-                Self::Rx {
+                Self::RX {
                     mosi: _,
                     clock: _,
                     chip_select: _,
                 } => unreachable!(),
-                Self::Tx {
+                Self::TX {
                     miso,
                     clock: _,
                     chip_select: _,
@@ -449,18 +703,18 @@ impl<const Cs: bool, const Rx: bool, const Tx: bool> Pins<Cs, Rx, Tx> {
     }
 }
 
-impl<const Cs: bool, const Rx: bool, const Tx: bool> Pins<Cs, Rx, Tx> {
+impl<const CS: bool, const RX: bool, const TX: bool> Pins<CS, RX, TX> {
     fn configure<I: Instance>(&self, instance: &mut I) {
         self.configure_cs(instance);
         self.configure_mosi(instance);
         self.configure_miso(instance);
         let clk = match self {
-            Self::Rx {
+            Self::RX {
                 mosi: _,
                 clock: _,
                 chip_select: _,
             } => unreachable!(),
-            Self::Tx {
+            Self::TX {
                 miso,
                 clock: _,
                 chip_select: _,
